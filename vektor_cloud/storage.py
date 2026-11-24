@@ -814,6 +814,36 @@ class DashboardStore:
     def memory_save(self, kind, key, value):
         return self._call("memory_save", kind, key, value)
 
+    def memory_save_unique(self, kind, key, value):
+        """Save as a NEW memory, never silently replacing an old one.
+
+        The memory table keys rows by (kind, key), so a plain save with a
+        repeated key overwrites the previous memory and the list never
+        grows — that is why Wallace could save one memory and then "not
+        add anything else". This path keeps the first save and appends
+        " (2)", " (3)", ... until the key is free. Saving the exact same
+        value again is a no-op (returns the existing row). Backend
+        agnostic: implemented on memory_get + memory_save, so it works
+        for SQLite and Supabase alike.
+        """
+        kind, key, value = validate_memory(kind, key, value)
+        existing = self.memory_get(kind, key)
+        if existing is not None and existing.get("value") == value:
+            return existing
+        if existing is None:
+            return self.memory_save(kind, key, value)
+        n = 2
+        while True:
+            candidate = f"{key} ({n})"
+            if len(candidate) > 120:
+                candidate = f"{key[:114]} ({n})"
+            row = self.memory_get(kind, candidate)
+            if row is None:
+                return self.memory_save(kind, candidate, value)
+            if row.get("value") == value:
+                return row
+            n += 1
+
     def memory_delete(self, kind, key):
         return self._call("memory_delete", kind, key)
 
