@@ -647,3 +647,225 @@ def test_supabase_replace_all_validates_first(monkeypatch):
                                   ("bogus", "bad", "nope")])
     assert store.memory_get("fact", "keep")["value"] == "stays"
     assert len(fake.rows) == 1
+
+# ---------------------------------------------------------------------------
+# Follow-up 2 (Big Chat CHANGES REQUESTED on FU1): strict import parsing
+# and truthful instructions durability
+# ---------------------------------------------------------------------------
+
+def _seed_two_memories(mem_env):
+    """Two memories in the DB + a matching MEMORY.md mirror on disk."""
+    store = app.store()
+    store.memory_save("fact", "keep-a", "first stays")
+    store.memory_save("fact", "keep-b", "second stays")
+    app.sync_memory_file()
+    return store
+
+
+def test_import_rejects_empty_value_and_keeps_db(mem_env):
+    """FU2 finding 1: an entry with an empty value aborts the import."""
+    store = _seed_two_memories(mem_env)
+    path = app.memory_file_path()
+    path.write_text(
+        "## [fact] keep-a\nfirst stays changed\n"
+        "## [fact] hollow\n"
+        "## [fact] keep-b\nsecond stays\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="empty value"):
+        app.import_memory_file()
+    # Nothing was written: not even the valid entry's changed value.
+    assert store.memory_get("fact", "keep-a")["value"] == "first stays"
+    assert store.memory_get("fact", "keep-b")["value"] == "second stays"
+    assert store.memory_get("fact", "hollow") is None
+    assert len(store.memory_list()) == 2
+
+
+def test_import_rejects_malformed_heading_and_keeps_db(mem_env):
+    """FU2 finding 1: an unclosed heading aborts the import."""
+    store = _seed_two_memories(mem_env)
+    path = app.memory_file_path()
+    path.write_text(
+        "## [fact] keep-a\nfirst stays\n"
+        "## [fact broken\n"
+        "## [fact] keep-b\nsecond stays\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="malformed"):
+        app.import_memory_file()
+    assert len(store.memory_list()) == 2
+    assert store.memory_get("fact", "keep-a")["value"] == "first stays"
+    # Parse-level: empty kind / empty key are malformed too.
+    with pytest.raises(ValueError, match="malformed"):
+        app.parse_memory_file("## [] key\nvalue\n")
+    with pytest.raises(ValueError, match="malformed"):
+        app.parse_memory_file("## [fact] \nvalue\n")
+    with pytest.raises(ValueError, match="malformed"):
+        app.parse_memory_file("## [fact\nvalue\n")
+
+
+def test_import_rejects_duplicate_key_and_keeps_db(mem_env):
+    """FU2 finding 1: a repeated (kind, key) aborts the import."""
+    store = _seed_two_memories(mem_env)
+    path = app.memory_file_path()
+    path.write_text(
+        "## [fact] keep-a\nfirst stays\n"
+        "## [fact] keep-a\nsecond copy\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="duplicate"):
+        app.import_memory_file()
+    assert len(store.memory_list()) == 2
+    assert store.memory_get("fact", "keep-a")["value"] == "first stays"
+
+
+def test_post_memory_file_rejects_bad_document_before_writing(mem_env):
+    """FU2 finding 1: the textarea endpoint rejects a bad document
+    before the file on disk is touched."""
+    store = _seed_two_memories(mem_env)
+    path = app.memory_file_path()
+    before = path.read_text(encoding="utf-8")
+    h = make_handler("POST", "/api/memory/file", {"content":
+        "## [fact] keep-a\nfirst stays\n"
+        "## [fact] hollow\n"
+        "## [fact] keep-b\nsecond stays\n"})
+    h.do_POST()
+    assert h._status == 400, response_json(h)
+    assert "empty value" in response_json(h)["error"]
+    assert path.read_text(encoding="utf-8") == before
+    assert len(store.memory_list()) == 2
+    # And the import endpoint reports the same rejection.
+    path.write_text(
+        "## [fact] keep-a\nfirst stays\n"
+        "## [fact] keep-a\nsecond copy\n", encoding="utf-8")
+    h = make_handler("POST", "/api/memory/file/import")
+    h.do_POST()
+    assert h._status == 400, response_json(h)
+    assert "duplicate" in response_json(h)["error"]
+    assert len(store.memory_list()) == 2
+
+
+def test_get_memory_file_reports_parse_error_not_500(mem_env):
+    """FU2 finding 1: a malformed file still reads as-is (200)."""
+    _seed_two_memories(mem_env)
+    path = app.memory_file_path()
+    path.write_text("## [fact] keep-a\nfirst stays\n"
+                    "## [fact broken\n", encoding="utf-8")
+    h = make_handler("GET", "/api/memory/file")
+    h.do_GET()
+    assert h._status == 200
+    body = response_json(h)
+    assert "first stays" in body["content"]
+    assert body["count"] == 0
+    assert body["parse_error"] and "malformed" in body["parse_error"]
+    # The DB is untouched by the read.
+    assert len(app.store().memory_list()) == 2
+
+
+def _supabase_down_env(mem_env, monkeypatch, render=True):
+    """mem_env plus a configured-but-unreachable Supabase.
+
+    render=True models the Render deployment, where container SQLite
+    is ephemeral; render=False models local/Termux. Render is
+    modelled by patching app.on_render (the durability decision's
+    seam) rather than the RENDER env var, which would also close
+    the auth gate (require_auth refuses password-less requests on
+    Render) — the auth gate is not what this test exercises.
+    """
+    monkeypatch.setattr(app, "on_render", lambda: render)
+    monkeypatch.setenv("SUPABASE_URL", "https://example.supabase.co")
+    monkeypatch.setenv("SUPABASE_KEY", "test-key")
+    app._STORES.clear()
+    store = app.store()
+    assert store._remote is not None
+
+    def boom(*args, **kwargs):
+        raise ConnectionError("supabase down")
+
+    monkeypatch.setattr(store._remote, "_request", boom)
+    return store
+
+
+def test_instructions_report_sqlite_when_supabase_down(mem_env, monkeypatch):
+    """FU2 finding 2 (Render): a Supabase outage must NOT report
+    durable — the write landed in ephemeral SQLite."""
+    _supabase_down_env(mem_env, monkeypatch, render=True)
+    saved, durable, backend = app.save_instructions(
+        "# How to work with Wallace\n\n- Always test first.\n")
+    assert saved is True
+    assert durable is False
+    assert backend == "sqlite"
+    assert app.instructions_are_durable() is False
+    # The API says the same, and the content is still readable
+    # from the SQLite fallback (it is saved, just not durable).
+    h = make_handler("POST", "/api/instructions",
+                     {"content": "# How to work with Wallace\n\n"
+                                "- Always test first.\n"})
+    h.do_POST()
+    assert h._status == 200
+    body = response_json(h)
+    assert body["durable"] is False
+    assert body["backend"] == "sqlite"
+    h = make_handler("GET", "/api/instructions")
+    h.do_GET()
+    body = response_json(h)
+    assert body["durable"] is False
+    # The setting exists — in SQLite, which the backend field says
+    # plainly. Durable is False because on Render that SQLite is
+    # ephemeral; the content is still readable from the fallback.
+    assert body["backend"] == "sqlite"
+    assert "Always test first." in body["content"]
+
+
+def test_instructions_sqlite_is_durable_off_render(mem_env, monkeypatch):
+    """FU2 finding 2 (local): off Render the SQLite file persists,
+    so a SQLite-backed save is honestly durable there."""
+    _supabase_down_env(mem_env, monkeypatch, render=False)
+    saved, durable, backend = app.save_instructions(
+        "# How to work with Wallace\n\n- Local only.\n")
+    assert (saved, durable, backend) == (True, True, "sqlite")
+    assert app.instructions_are_durable() is True
+
+
+class FakeSettingsPostgrest(FakePostgrest):
+    """FakePostgrest plus the vektor_settings table."""
+
+    def __init__(self):
+        super().__init__()
+        self.settings = {}
+
+    def request(self, method, table, query=None, payload=None, prefer=None,
+                timeout=10):
+        if table == "vektor_settings":
+            if method == "GET":
+                filt = (query or {}).get("key", "")
+                if filt.startswith("eq."):
+                    from urllib.parse import unquote
+                    key = unquote(filt[3:])
+                    return ([{"value": self.settings[key]}]
+                            if key in self.settings else [])
+                return [{"key": k, "value": v}
+                        for k, v in self.settings.items()]
+            if method == "POST":
+                for row in payload or []:
+                    self.settings[row["key"]] = row["value"]
+                return None
+            raise AssertionError(f"unexpected method {method}")
+        return super().request(method, table, query, payload, prefer,
+                               timeout)
+
+
+def test_instructions_report_supabase_when_up(mem_env, monkeypatch):
+    """FU2 finding 2: a Supabase write reports durable + supabase."""
+    monkeypatch.setenv("SUPABASE_URL", "https://example.supabase.co")
+    monkeypatch.setenv("SUPABASE_KEY", "test-key")
+    app._STORES.clear()
+    store = app.store()
+    fake = FakeSettingsPostgrest()
+    monkeypatch.setattr(store._remote, "_request", fake.request)
+    saved, durable, backend = app.save_instructions(
+        "# How to work with Wallace\n\n- Always test first.\n")
+    assert (saved, durable, backend) == (True, True, "supabase")
+    assert fake.settings.get("instructions", "").endswith(
+        "Always test first.\n")
+    assert app.instructions_are_durable() is True
+    h = make_handler("GET", "/api/instructions")
+    h.do_GET()
+    body = response_json(h)
+    assert body["durable"] is True
+    assert body["backend"] == "supabase"
+    assert "Always test first." in body["content"]

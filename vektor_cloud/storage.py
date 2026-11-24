@@ -906,15 +906,27 @@ class DashboardStore:
             "supabase_error": self.last_error,
         }
 
-    def _call(self, name, *args, **kwargs):
+    def call_with_backend(self, name, *args, **kwargs):
+        """Run a backend call and report which backend really served it.
+
+        The plain _call() silently falls back to SQLite when Supabase
+        fails; callers that must judge durability (settings) need the
+        truth, not the fallback. Returns (result, "supabase" |
+        "sqlite").
+        """
         if self._remote and time.time() >= self._remote_down_until:
             try:
-                return getattr(self._remote, name)(*args, **kwargs)
+                return getattr(self._remote, name)(*args, **kwargs), \
+                    "supabase"
             except Exception as exc:
                 # Fall back locally; remember why so /api/state can report it.
                 self.last_error = str(exc)[:240]
                 self._remote_down_until = time.time() + 60
-        return getattr(self.sqlite, name)(*args, **kwargs)
+        return getattr(self.sqlite, name)(*args, **kwargs), "sqlite"
+
+    def _call(self, name, *args, **kwargs):
+        result, _backend = self.call_with_backend(name, *args, **kwargs)
+        return result
 
     def get_setting(self, key, default):
         return self._call("get_setting", key, default)

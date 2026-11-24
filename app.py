@@ -602,32 +602,59 @@ def render_memory_file(memories):
 def parse_memory_file(text):
     """Parse the MEMORY.md format back into (kind, key, value) rows.
 
-    Headings look like `## [fact] some key`. Value lines run until the next
-    heading. A value line starting with `## [` would be misread as a
-    heading — values are stored verbatim otherwise.
+    Strict: the whole document is validated before anything is
+    written. A malformed heading, an entry with an empty value, or a
+    duplicate (kind, key) raises ValueError — the import is rejected
+    and the database is left untouched. Headings look like
+    `## [fact] some key`. Value lines run until the next heading.
+    Lines before the first heading are the file's own header
+    (render_memory_file writes one) and are ignored — they are not
+    memories, so ignoring them loses no memory. A value line starting
+    with `## [` would be misread as a heading — values are stored
+    verbatim otherwise.
     """
     rows = []
+    seen = set()
     kind = key = None
     buf = []
+
+    def flush():
+        nonlocal kind, key, buf
+        if kind is None:
+            return
+        value = "\n".join(buf).strip()
+        if not value:
+            raise ValueError(
+                f"memory '{kind} / {key}' has an empty value")
+        if (kind, key) in seen:
+            raise ValueError(
+                f"duplicate memory '{kind} / {key}'")
+        seen.add((kind, key))
+        rows.append((kind, key, value))
+        kind = key = None
+        buf = []
+
     for raw in (text or "").splitlines():
         line = raw.rstrip("\n")
         if line.startswith("## ["):
-            if kind is not None and key is not None:
-                rows.append((kind, key, "\n".join(buf).strip()))
+            flush()
             try:
                 head, key = line[4:].split("]", 1)
-                kind = head.strip()
-                key = key.strip()
-                buf = []
             except ValueError:
-                kind = key = None
-                buf = []
+                raise ValueError(
+                    f"malformed memory heading: {line!r}")
+            kind = head.strip()
+            key = key.strip()
+            if not kind or not key:
+                raise ValueError(
+                    f"malformed memory heading: {line!r}")
+            buf = []
             continue
-        if kind is not None and key is not None:
+        if kind is not None:
             buf.append(line)
-    if kind is not None and key is not None:
-        rows.append((kind, key, "\n".join(buf).strip()))
-    return [(k, kk, v) for (k, kk, v) in rows if kk and v]
+        # Lines before the first heading are the file header; ignored.
+    flush()
+    return rows
 
 
 def sync_memory_file():
@@ -696,34 +723,81 @@ def load_instructions():
     return read_context_file(instructions_file_path(), 12000)
 
 
-def instructions_are_durable():
-    """True when the instructions live in the DB setting (they survive
-    a Render redeploy). The file alone is ephemeral on Render."""
+def _backend_is_durable(backend):
+    """A settings backend survives a Render redeploy: Supabase always
+    does; container SQLite does not. Off Render (local / Termux) the
+    SQLite file persists, so it counts as durable there."""
+    if backend == "supabase":
+        return True
+    return not on_render()
+
+
+def _call_with_backend(name, *args, **kwargs):
+    """A store call plus the backend that really served it.
+
+    DashboardStore._call() silently falls back to SQLite when
+    Supabase fails; durability must be judged on the backend that
+    actually stored the value. Falls back to a plain call (reported
+    as the store's configured backend) for stores without the
+    traced call.
+    """
+    obj = store()
+    traced = getattr(obj, "call_with_backend", None)
+    if traced is not None:
+        return traced(name, *args, **kwargs)
+    return getattr(obj, name)(*args, **kwargs), getattr(
+        obj, "backend", "sqlite")
+
+
+def instructions_status():
+    """(saved, durable, backend) for Wallace's instructions.
+
+    saved: a non-empty instruction text exists in the DB setting.
+    durable: it survives a Render redeploy (Supabase, or local
+    SQLite off Render). backend: the backend that actually holds
+    it ("supabase" / "sqlite", or None when nothing is stored).
+    """
     if not (supabase_config() or DB.exists()):
-        return False
+        return (False, False, None)
     try:
-        saved = store().get_setting(INSTRUCTIONS_SETTING, "")
-        return isinstance(saved, str) and bool(saved.strip())
+        saved, backend = _call_with_backend(
+            "get_setting", INSTRUCTIONS_SETTING, "")
     except Exception:
-        return False
+        return (False, False, None)
+    exists = isinstance(saved, str) and bool(saved.strip())
+    if not exists:
+        return (False, False, None)
+    return (True, _backend_is_durable(backend), backend)
+
+
+def instructions_are_durable():
+    """True when the instructions live where they survive a Render
+    redeploy. The file alone is ephemeral on Render; a SQLite
+    fallback while Supabase is down is not durable there either."""
+    return instructions_status()[1]
 
 
 def save_instructions(content):
     """Save Wallace's instructions durably (DB setting) + file mirror.
 
-    Returns (saved, durable): durable is False only when the DB write
-    failed and the file is the only copy. A file-write error propagates
-    (the caller reports it); a DB failure never blocks the local save.
+    Returns (saved, durable, backend): backend is the store that
+    really took the write ("supabase" / "sqlite" / None when the DB
+    write failed outright). durable is False when the write landed
+    only in ephemeral SQLite on Render, or failed. A file-write
+    error propagates (the caller reports it); a DB failure never
+    blocks the local save.
     """
-    durable = True
     try:
-        store().set_setting(INSTRUCTIONS_SETTING, content)
+        _, backend = _call_with_backend(
+            "set_setting", INSTRUCTIONS_SETTING, content)
+        durable = _backend_is_durable(backend)
     except Exception:
+        backend = None
         durable = False
     path = instructions_file_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
-    return (True, durable)
+    return (True, durable, backend)
 
 
 def migrate_instructions_to_db():
@@ -2073,7 +2147,15 @@ class Handler(BaseHTTPRequestHandler):
             content = read_context_file(memory_file_path(), 24000)
             if not content:
                 content = render_memory_file(store().memory_list() or [])
-            self.send_json({"ok": True, "path": str(memory_file_path()), "content": content, "count": len(parse_memory_file(content))}); return
+            # A malformed file still reads as-is (never a 500): the
+            # count is 0 and the parse error is reported alongside.
+            try:
+                count = len(parse_memory_file(content))
+                parse_error = None
+            except ValueError as exc:
+                count = 0
+                parse_error = str(exc)
+            self.send_json({"ok": True, "path": str(memory_file_path()), "content": content, "count": count, "parse_error": parse_error}); return
         if self.path == "/api/instructions":
             # WORKING.md (how VektorCode works with Wallace). Unsaved yet:
             # the starter text is shown, flagged saved=False. durable=True
@@ -2081,7 +2163,8 @@ class Handler(BaseHTTPRequestHandler):
             # Render redeploy; the file alone is ephemeral there.
             if not require_auth(self): self.send_json({"ok": False, "error": "Authentication required", "retryable": False}, 401); return
             content = load_instructions()
-            self.send_json({"ok": True, "content": content or DEFAULT_INSTRUCTIONS.strip(), "saved": bool(content), "durable": instructions_are_durable()}); return
+            saved, durable, backend = instructions_status()
+            self.send_json({"ok": True, "content": content or DEFAULT_INSTRUCTIONS.strip(), "saved": bool(content), "durable": durable, "backend": backend}); return
         if self.path == "/api/mood":
             self.send_json({"ok": True, "mood": get_mood(), "moods": sorted(MOODS)}); return
         if self.path in ("/", "/index.html") or self.path.startswith("/static/"):
@@ -2225,7 +2308,14 @@ class Handler(BaseHTTPRequestHandler):
             content = data.get("content", "")
             if not isinstance(content, str) or len(content) > 24000:
                 self.send_json({"ok":False,"error":"content must be 0-24000 characters"}, 400); return
-            if not parse_memory_file(content):
+            # Strict validation before anything is written: a malformed
+            # document is rejected, so a bad textarea can never wipe
+            # the DB through replace semantics.
+            try:
+                rows = parse_memory_file(content)
+            except ValueError as exc:
+                self.send_json({"ok":False,"error":str(exc)}, 400); return
+            if not rows:
                 self.send_json({"ok":False,"error":"no memories found in the file — nothing imported"}, 400); return
             try:
                 target = memory_file_path()
@@ -2258,11 +2348,11 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(content, str) or not content.strip() or len(content) > 12000:
                 self.send_json({"ok":False,"error":"content must be 1-12000 characters"}, 400); return
             try:
-                saved, durable = save_instructions(content)
+                saved, durable, backend = save_instructions(content)
             except OSError as exc:
                 self.send_json({"ok":False,"error":str(exc)}, 500); return
-            receipt("instructions_saved", {"durable": durable}, True, True)
-            self.send_json({"ok":True, "durable": durable}); return
+            receipt("instructions_saved", {"durable": durable, "backend": backend}, True, True)
+            self.send_json({"ok":True, "durable": durable, "backend": backend}); return
         if path == "/api/mood":
             # Set Wallace's mood (fixed set only; stored in settings).
             if not require_auth(self): self.send_json({"ok":False,"error":"Authentication required"}, 401); return
