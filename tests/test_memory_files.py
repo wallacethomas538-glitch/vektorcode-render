@@ -869,3 +869,92 @@ def test_instructions_report_supabase_when_up(mem_env, monkeypatch):
     assert body["durable"] is True
     assert body["backend"] == "supabase"
     assert "Always test first." in body["content"]
+
+
+# ---------------------------------------------------------------------------
+# FU3 (Big Chat review of FU2, Nov 23): mistyped headings + single-read GET
+# ---------------------------------------------------------------------------
+
+def test_import_rejects_mistyped_heading_and_keeps_db(mem_env):
+    """FU3 finding 1: a level-two heading without the opening bracket
+    is malformed — it must not be silently swallowed as preamble, or
+    a replace import could delete the memory it names."""
+    store = app.store()
+    store.memory_save("fact", "forgotten", "this must not disappear")
+    store.memory_save("fact", "keep", "this remains")
+    app.sync_memory_file()
+    path = app.memory_file_path()
+    # Big Chat's example verbatim: the mistyped heading comes first,
+    # before a valid entry, under the file's own level-one header.
+    path.write_text(
+        "# VektorCode memories\n\n"
+        "## fact] forgotten\n"
+        "This memory should not disappear.\n\n"
+        "## [fact] keep\n"
+        "This memory remains.\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="malformed"):
+        app.import_memory_file()
+    # The DB is untouched: the mistyped memory survives.
+    assert store.memory_get("fact", "forgotten")["value"] == (
+        "this must not disappear")
+    assert store.memory_get("fact", "keep")["value"] == "this remains"
+    assert len(store.memory_list()) == 2
+    # The import endpoint reports the same rejection, DB still intact.
+    h = make_handler("POST", "/api/memory/file/import")
+    h.do_POST()
+    assert h._status == 400, response_json(h)
+    assert "malformed" in response_json(h)["error"]
+    assert len(store.memory_list()) == 2
+    # Parse-level: a mistyped heading inside a value is malformed
+    # too, not value text; a bare '## ' heading is malformed too.
+    with pytest.raises(ValueError, match="malformed"):
+        app.parse_memory_file(
+            "## [fact] keep\nfirst line\n## note to self\nsecond line\n")
+    with pytest.raises(ValueError, match="malformed"):
+        app.parse_memory_file("## [fact] keep\nvalue\n## \n")
+
+
+def test_subheading_inside_value_stays_value_text(mem_env):
+    """FU3 finding 1 guard: a deeper heading inside a value is plain
+    text — only level-two headings are heading positions."""
+    store = app.store()
+    store.memory_save("fact", "notes", "line one\n### detail\nline three")
+    app.sync_memory_file()
+    imported, skipped = app.import_memory_file()
+    assert imported == 1 and skipped == 0
+    assert store.memory_get("fact", "notes")["value"] == (
+        "line one\n### detail\nline three")
+
+
+def test_get_instructions_reads_setting_once(mem_env, monkeypatch):
+    """FU3 finding 2: GET /api/instructions derives content, saved,
+    backend and durability from a single store read — no split reads
+    that could disagree if the Supabase fallback flips between them."""
+    store = app.store()
+    app.save_instructions("# How to work with Wallace\n\n"
+                          "- Always test first.\n")
+    calls = []
+    orig = store.call_with_backend
+
+    def counting(name, *args, **kwargs):
+        calls.append(name)
+        return orig(name, *args, **kwargs)
+
+    monkeypatch.setattr(store, "call_with_backend", counting)
+
+    def _boom():
+        raise AssertionError(
+            "split read: GET must not call the old helpers")
+
+    monkeypatch.setattr(app, "load_instructions", _boom)
+    monkeypatch.setattr(app, "instructions_status", _boom)
+    h = make_handler("GET", "/api/instructions")
+    h.do_GET()
+    assert h._status == 200, response_json(h)
+    body = response_json(h)
+    assert "Always test first." in body["content"]
+    assert body["saved"] is True
+    assert body["backend"] == "sqlite"
+    # Off Render the local SQLite file persists, so it is durable.
+    assert body["durable"] is True
+    assert calls == ["get_setting"]

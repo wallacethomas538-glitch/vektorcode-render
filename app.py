@@ -607,11 +607,17 @@ def parse_memory_file(text):
     duplicate (kind, key) raises ValueError — the import is rejected
     and the database is left untouched. Headings look like
     `## [fact] some key`. Value lines run until the next heading.
-    Lines before the first heading are the file's own header
-    (render_memory_file writes one) and are ignored — they are not
-    memories, so ignoring them loses no memory. A value line starting
-    with `## [` would be misread as a heading — values are stored
-    verbatim otherwise.
+    Every level-two heading line (`## ...`) is a heading position:
+    one that is not a valid `## [kind] key` heading is malformed and
+    raises — it is never silently swallowed as preamble or value
+    text, or a mistyped heading could delete the memory it names
+    on a replace import. Lines before the first heading are the
+    file's own header (render_memory_file writes one: a level-one
+    `# ...` title plus plain-text notes) and are ignored — they are
+    not memories, so ignoring them loses no memory. A value line
+    starting with `## ` would be misread as a heading — values are
+    stored verbatim otherwise. Deeper headings (`### ...`) inside a
+    value are plain value text, not level-two headings.
     """
     rows = []
     seen = set()
@@ -636,7 +642,10 @@ def parse_memory_file(text):
 
     for raw in (text or "").splitlines():
         line = raw.rstrip("\n")
-        if line.startswith("## ["):
+        if line.startswith("## "):
+            if not line.startswith("## ["):
+                raise ValueError(
+                    f"malformed memory heading: {line!r}")
             flush()
             try:
                 head, key = line[4:].split("]", 1)
@@ -704,6 +713,32 @@ def import_memory_file():
 INSTRUCTIONS_SETTING = "instructions"
 
 
+def load_instructions_with_status():
+    """(content, saved, durable, backend) from ONE store read.
+
+    A single traced get_setting call supplies both the text and the
+    backend that really served it, so a response can never pair
+    content read from one backend with a backend label from a
+    second, later read (a Supabase fallback cooldown starting
+    between two reads would do exactly that). saved: any instruction
+    text exists (DB setting, or the WORKING.md file fallback).
+    durable: the text survives a Render redeploy. backend: the
+    backend that served the read ("supabase" / "sqlite", or None
+    when the text came from the file fallback or nothing is saved).
+    """
+    if supabase_config() or DB.exists():
+        try:
+            saved_text, backend = _call_with_backend(
+                "get_setting", INSTRUCTIONS_SETTING, "")
+            if isinstance(saved_text, str) and saved_text.strip():
+                return (saved_text, True,
+                        _backend_is_durable(backend), backend)
+        except Exception:
+            pass
+    content = read_context_file(instructions_file_path(), 12000)
+    return (content, bool(content), False, None)
+
+
 def load_instructions():
     """Wallace's WORKING.md (how VektorCode works with him).
 
@@ -713,14 +748,7 @@ def load_instructions():
     result means nothing saved yet; the UI shows the starter text.
     Never creates a DB file on its own.
     """
-    if supabase_config() or DB.exists():
-        try:
-            saved = store().get_setting(INSTRUCTIONS_SETTING, "")
-            if isinstance(saved, str) and saved.strip():
-                return saved
-        except Exception:
-            pass
-    return read_context_file(instructions_file_path(), 12000)
+    return load_instructions_with_status()[0]
 
 
 def _backend_is_durable(backend):
@@ -2162,9 +2190,12 @@ class Handler(BaseHTTPRequestHandler):
             # means the text lives in the DB setting and survives a
             # Render redeploy; the file alone is ephemeral there.
             if not require_auth(self): self.send_json({"ok": False, "error": "Authentication required", "retryable": False}, 401); return
-            content = load_instructions()
-            saved, durable, backend = instructions_status()
-            self.send_json({"ok": True, "content": content or DEFAULT_INSTRUCTIONS.strip(), "saved": bool(content), "durable": durable, "backend": backend}); return
+            # One read supplies content, saved, backend and durability
+            # together (load_instructions_with_status): two separate
+            # reads could disagree if the Supabase fallback flips
+            # between them.
+            content, saved, durable, backend = load_instructions_with_status()
+            self.send_json({"ok": True, "content": content or DEFAULT_INSTRUCTIONS.strip(), "saved": saved, "durable": durable, "backend": backend}); return
         if self.path == "/api/mood":
             self.send_json({"ok": True, "mood": get_mood(), "moods": sorted(MOODS)}); return
         if self.path in ("/", "/index.html") or self.path.startswith("/static/"):
