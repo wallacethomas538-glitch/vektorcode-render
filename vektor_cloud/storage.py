@@ -106,6 +106,15 @@ def validate_memory(kind, key, value):
     return kind, key.strip(), value
 
 
+_UNIQUE_MAX_ATTEMPTS = 100
+
+
+def _unique_candidate(key, n):
+    """Suffix a memory key (``key (2)``) without exceeding 120 chars."""
+    suffix = f" ({n})"
+    return key[:120 - len(suffix)] + suffix
+
+
 def validate_mcp_server(data):
     """Validate an MCP registry row. Raises ValueError on bad input.
 
@@ -370,6 +379,75 @@ class SQLiteStore:
             conn.close()
         return {"kind": kind, "key": key, "value": value,
                 "updated_at": now}
+
+    def memory_save_unique(self, kind, key, value):
+        """Save as a NEW memory, never silently replacing an old one.
+
+        Atomic under ThreadingHTTPServer: the whole check-and-insert
+        loop runs inside one BEGIN IMMEDIATE transaction, so two
+        simultaneous requests cannot both see the same free key and
+        overwrite each other. Saving the exact same value again is a
+        no-op (returns the existing row).
+        """
+        kind, key, value = validate_memory(kind, key, value)
+        conn = sqlite_connect(self.path)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                for attempt in range(_UNIQUE_MAX_ATTEMPTS):
+                    candidate = (key if attempt == 0
+                                 else _unique_candidate(key, attempt + 1))
+                    row = conn.execute(
+                        "SELECT kind, key, value, updated_at FROM memory"
+                        " WHERE kind=? AND key=?",
+                        (kind, candidate)).fetchone()
+                    if row is not None:
+                        if row["value"] == value:
+                            conn.rollback()
+                            return dict(row)
+                        continue
+                    now = time.time()
+                    conn.execute(
+                        "INSERT INTO memory VALUES (?,?,?,?)",
+                        (kind, candidate, value, now))
+                    conn.commit()
+                    return {"kind": kind, "key": candidate,
+                            "value": value, "updated_at": now}
+                raise StorageError("could not find a free memory key")
+            except Exception:
+                conn.rollback()
+                raise
+        finally:
+            conn.close()
+
+    def memory_replace_all(self, rows):
+        """Replace ALL memories with the given rows, atomically.
+
+        Every row is validated BEFORE any write, so a bad row aborts
+        the import without touching existing data. The delete + inserts
+        run in one BEGIN IMMEDIATE transaction: a failure rolls the
+        whole import back. An empty list is refused — wiping the DB on
+        an empty file is never the intent.
+        """
+        if not rows:
+            raise ValueError("no memories to import")
+        validated = [validate_memory(k, kk, v) for (k, kk, v) in rows]
+        conn = sqlite_connect(self.path)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute("DELETE FROM memory")
+                now = time.time()
+                conn.executemany(
+                    "INSERT INTO memory VALUES (?,?,?,?)",
+                    [(k, kk, v, now) for (k, kk, v) in validated])
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+        finally:
+            conn.close()
+        return len(validated)
 
     def memory_delete(self, kind, key):
         conn = sqlite_connect(self.path)
@@ -662,6 +740,64 @@ class SupabaseStore:
         return {"kind": kind, "key": key, "value": value,
                 "updated_at": now}
 
+    def memory_save_unique(self, kind, key, value):
+        """Save as a NEW memory, never silently replacing an old one.
+
+        Atomicity via PostgREST: each candidate key is inserted with
+        resolution=ignore-duplicates and return=representation. The
+        insert either wins (the row comes back) or loses to an existing
+        row (nothing comes back) — there is no check-then-save race.
+        On a loss the existing row is read back: the same value is a
+        no-op, otherwise the next suffix is tried. Bounded retries.
+        """
+        kind, key, value = validate_memory(kind, key, value)
+        for attempt in range(_UNIQUE_MAX_ATTEMPTS):
+            candidate = (key if attempt == 0
+                         else _unique_candidate(key, attempt + 1))
+            row = self.memory_get(kind, candidate)
+            if row is not None:
+                if row.get("value") == value:
+                    return row
+                continue
+            inserted = self._request(
+                "POST", MEMORY_TABLE,
+                None,
+                [{"kind": kind, "key": candidate, "value": value,
+                  "updated_at": time.time()}],
+                "resolution=ignore-duplicates,return=representation")
+            if inserted:
+                return inserted[0]
+            # Lost the race: someone else took this key. Re-read it.
+            row = self.memory_get(kind, candidate)
+            if row is not None and row.get("value") == value:
+                return row
+        raise StorageError("could not find a free memory key")
+
+    def memory_replace_all(self, rows):
+        """Replace ALL memories with the given rows.
+
+        Every row is validated BEFORE any write, so a bad row aborts
+        without touching existing data. Writes go insert-first: the new
+        rows are upserted, then rows missing from the new set are
+        deleted. A failure during the deletes can leave stale rows
+        behind, but never deletes data that was not already replaced.
+        """
+        if not rows:
+            raise ValueError("no memories to import")
+        validated = [validate_memory(k, kk, v) for (k, kk, v) in rows]
+        new_keys = {(k, kk) for (k, kk, v) in validated}
+        now = time.time()
+        self._request(
+            "POST", MEMORY_TABLE,
+            {"on_conflict": "kind,key"},
+            [{"kind": k, "key": kk, "value": v, "updated_at": now}
+             for (k, kk, v) in validated],
+            "resolution=merge-duplicates,return=minimal")
+        for item in self.memory_list() or []:
+            if (item.get("kind"), item.get("key")) not in new_keys:
+                self.memory_delete(item.get("kind"), item.get("key"))
+        return len(validated)
+
     def memory_delete(self, kind, key):
         # PostgREST DELETE returns no row count here; True means the
         # request succeeded.
@@ -770,15 +906,27 @@ class DashboardStore:
             "supabase_error": self.last_error,
         }
 
-    def _call(self, name, *args, **kwargs):
+    def call_with_backend(self, name, *args, **kwargs):
+        """Run a backend call and report which backend really served it.
+
+        The plain _call() silently falls back to SQLite when Supabase
+        fails; callers that must judge durability (settings) need the
+        truth, not the fallback. Returns (result, "supabase" |
+        "sqlite").
+        """
         if self._remote and time.time() >= self._remote_down_until:
             try:
-                return getattr(self._remote, name)(*args, **kwargs)
+                return getattr(self._remote, name)(*args, **kwargs), \
+                    "supabase"
             except Exception as exc:
                 # Fall back locally; remember why so /api/state can report it.
                 self.last_error = str(exc)[:240]
                 self._remote_down_until = time.time() + 60
-        return getattr(self.sqlite, name)(*args, **kwargs)
+        return getattr(self.sqlite, name)(*args, **kwargs), "sqlite"
+
+    def _call(self, name, *args, **kwargs):
+        result, _backend = self.call_with_backend(name, *args, **kwargs)
+        return result
 
     def get_setting(self, key, default):
         return self._call("get_setting", key, default)
@@ -813,6 +961,20 @@ class DashboardStore:
 
     def memory_save(self, kind, key, value):
         return self._call("memory_save", kind, key, value)
+
+    def memory_save_unique(self, kind, key, value):
+        """Save as a NEW memory, never silently replacing an old one.
+
+        Delegates to the active backend, which makes the insert atomic
+        (SQLite: one BEGIN IMMEDIATE transaction; Supabase: insert with
+        resolution=ignore-duplicates). Saving the exact same value
+        again is a no-op (returns the existing row).
+        """
+        return self._call("memory_save_unique", kind, key, value)
+
+    def memory_replace_all(self, rows):
+        """Replace ALL memories with the given rows (see backends)."""
+        return self._call("memory_replace_all", rows)
 
     def memory_delete(self, kind, key):
         return self._call("memory_delete", kind, key)

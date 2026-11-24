@@ -75,7 +75,10 @@ async function refreshState() {
     renderSettingsBits();
     await loadMcpServers();
     renderMcpServers();
+    renderMood();
     await loadMemories();
+    await loadMemoryFile();
+    await loadInstructions();
 }
 
 function renderModels() {
@@ -261,6 +264,8 @@ async function loadMemories() {
 function renderMemories(memories) {
     const list = $('memory-list');
     if (!list) return;
+    const count = $('memory-count');
+    if (count) count.textContent = memories.length ? `(${memories.length})` : '';
     if (!memories.length) {
         list.innerHTML = '<div class="muted">No memories saved yet.</div>';
         return;
@@ -275,18 +280,108 @@ function renderMemories(memories) {
 
 async function saveMemory() {
     const kind = $('memory-kind').value;
-    const key = $('memory-key').value.trim();
+    let key = $('memory-key').value.trim();
     const value = $('memory-value').value.trim();
-    if (!key || !value) { toast('Enter a key and a value to save.'); return; }
-    const res = await api('/api/memory', { kind, key, value }, 'POST');
+    if (!value) { toast('Enter something for VektorCode to remember.'); return; }
+    // No key typed: auto-key from the first words of the value. A repeated
+    // key never replaces — the server saves it as a new memory ("key (2)").
+    if (!key) {
+        key = value.toLowerCase().replace(/[^a-z0-9 ]+/g, '').split(/\s+/).slice(0, 5).join('-').slice(0, 100) || 'note';
+    }
+    const res = await api('/api/memory', { kind, key, value, mode: 'new' }, 'POST');
     if (res && res.ok) {
         $('memory-key').value = '';
         $('memory-value').value = '';
-        toast('Memory saved.');
+        toast(res.memory && res.memory.key !== key ? `Memory saved as "${res.memory.key}".` : 'Memory saved.');
         await loadMemories();
         await refreshState(); // pick up the memory_saved receipt
     } else {
         toast('Could not save memory: ' + ((res && res.error) || 'unknown error'));
+    }
+}
+
+/* ---------- memory file (MEMORY.md), instructions, mood ---------- */
+
+// The editable MEMORY.md mirror: one plain file with every memory.
+async function loadMemoryFile() {
+    const box = $('memory-file');
+    if (!box) return;
+    const res = await api('/api/memory/file');
+    if (!res || !res.ok) return;
+    box.value = res.content || '';
+    const pathEl = $('memory-file-path');
+    if (pathEl && res.path) pathEl.textContent = res.path;
+}
+
+async function saveMemoryFile() {
+    const box = $('memory-file');
+    if (!box) return;
+    const res = await api('/api/memory/file', { content: box.value }, 'POST');
+    if (res && res.ok) {
+        toast(`File saved: ${res.imported} memories loaded, ${res.skipped} skipped.`);
+        await loadMemories();
+        await loadMemoryFile();
+    } else {
+        toast('Could not save file: ' + ((res && res.error) || 'unknown error'));
+    }
+}
+
+async function importMemoryFile() {
+    const res = await api('/api/memory/file/import', {}, 'POST');
+    if (res && res.ok) {
+        toast(`Reloaded from file: ${res.imported} memories, ${res.skipped} skipped.`);
+        await loadMemories();
+        await loadMemoryFile();
+    } else {
+        toast('Could not reload file: ' + ((res && res.error) || 'unknown error'));
+    }
+}
+
+function downloadMemoryFile() {
+    const box = $('memory-file');
+    if (!box) return;
+    const blob = new Blob([box.value], { type: 'text/markdown' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'MEMORY.md';
+    a.click();
+    URL.revokeObjectURL(a.href);
+}
+
+// WORKING.md: how VektorCode works with Wallace, loaded into every chat.
+async function loadInstructions() {
+    const box = $('instructions-text');
+    if (!box) return;
+    const res = await api('/api/instructions');
+    if (!res || !res.ok) return;
+    box.value = res.content || '';
+}
+
+async function saveInstructions() {
+    const box = $('instructions-text');
+    if (!box) return;
+    const res = await api('/api/instructions', { content: box.value }, 'POST');
+    toast(res && res.ok ? 'Instructions saved.' : 'Could not save instructions: ' + ((res && res.error) || 'unknown error'));
+}
+
+// Mood: a fixed set of tones, saved in the database.
+function renderMood() {
+    const select = $('mood-select');
+    if (!select || !state.moods) return;
+    const current = state.mood || 'focused';
+    select.innerHTML = state.moods.map((m) =>
+        `<option value="${esc(m)}" ${m === current ? 'selected' : ''}>${esc(m)}</option>`
+    ).join('');
+}
+
+async function setMood(mood) {
+    const res = await api('/api/mood', { mood }, 'POST');
+    if (res && res.ok) {
+        state.mood = res.mood;
+        toast(`Mood set to ${res.mood}.`);
+    } else {
+        toast('Could not set mood: ' + ((res && res.error) || 'unknown error'));
+        renderMood();
     }
 }
 
