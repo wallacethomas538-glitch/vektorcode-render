@@ -560,8 +560,11 @@ def read_context_file(path, limit=24000):
 # One plain Markdown file Wallace can open and edit:
 # VEKTOR_STATE/memories/MEMORY.md. The DB (Supabase first) stays the source
 # of truth; the file is the editable mirror. On Render the container file is
-# ephemeral and is rebuilt from the DB after every mutation and at startup
-# — the DB is what survives a redeploy, never the file alone.
+# ephemeral and is rebuilt from the DB after every DB mutation — the DB is
+# what survives a redeploy, never the file alone. A read or a startup never
+# regenerates the file: an edit Wallace made on disk (not yet imported)
+# must survive a browser refresh. Instructions (WORKING.md) are DB-backed
+# (settings) with the file as the local fallback, so they survive too.
 
 def memory_file_path():
     return VEKTOR_STATE / "memories" / "MEMORY.md"
@@ -639,28 +642,107 @@ def sync_memory_file():
         return False
 
 
+def ensure_memory_file():
+    """Create the MEMORY.md mirror from the DB only when it is missing.
+
+    A startup must never regenerate the file: an edit Wallace made on
+    disk (not yet imported) would be silently destroyed. The mirror is
+    rebuilt after every DB mutation instead.
+    """
+    if not memory_file_path().exists():
+        sync_memory_file()
+
+
 def import_memory_file():
     """Load MEMORY.md from disk into the DB (replace semantics: the file is
-    the editor's intent). Returns (imported, skipped)."""
+    the editor's intent). Returns (imported, skipped).
+
+    Genuine replacement: rows missing from the file are DELETED from the
+    DB. Every row is validated before any write, so a bad row raises
+    ValueError and aborts the import without touching existing data.
+    An empty file imports nothing and never wipes the DB.
+    """
     try:
         text = memory_file_path().read_text(encoding="utf-8")
     except OSError:
         return (0, 0)
-    imported = skipped = 0
-    for kind, key, value in parse_memory_file(text):
-        try:
-            store().memory_save(kind, key, value)
-            imported += 1
-        except ValueError:
-            skipped += 1
+    rows = parse_memory_file(text)
+    if not rows:
+        return (0, 0)
+    imported = store().memory_replace_all(rows)
     sync_memory_file()
-    return (imported, skipped)
+    return (imported, 0)
+
+
+INSTRUCTIONS_SETTING = "instructions"
 
 
 def load_instructions():
-    """Wallace's WORKING.md (how VektorCode works with him). Read-only: an
-    empty result means nothing saved yet; the UI shows the starter text."""
+    """Wallace's WORKING.md (how VektorCode works with him).
+
+    Durable source first: the DB setting (Supabase-backed, SQLite
+    fallback) survives a Render redeploy. The WORKING.md file is the
+    local fallback (legacy file-only content, Termux edits). An empty
+    result means nothing saved yet; the UI shows the starter text.
+    Never creates a DB file on its own.
+    """
+    if supabase_config() or DB.exists():
+        try:
+            saved = store().get_setting(INSTRUCTIONS_SETTING, "")
+            if isinstance(saved, str) and saved.strip():
+                return saved
+        except Exception:
+            pass
     return read_context_file(instructions_file_path(), 12000)
+
+
+def instructions_are_durable():
+    """True when the instructions live in the DB setting (they survive
+    a Render redeploy). The file alone is ephemeral on Render."""
+    if not (supabase_config() or DB.exists()):
+        return False
+    try:
+        saved = store().get_setting(INSTRUCTIONS_SETTING, "")
+        return isinstance(saved, str) and bool(saved.strip())
+    except Exception:
+        return False
+
+
+def save_instructions(content):
+    """Save Wallace's instructions durably (DB setting) + file mirror.
+
+    Returns (saved, durable): durable is False only when the DB write
+    failed and the file is the only copy. A file-write error propagates
+    (the caller reports it); a DB failure never blocks the local save.
+    """
+    durable = True
+    try:
+        store().set_setting(INSTRUCTIONS_SETTING, content)
+    except Exception:
+        durable = False
+    path = instructions_file_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+    return (True, durable)
+
+
+def migrate_instructions_to_db():
+    """One-way migration: file-only instructions into the DB setting.
+
+    Runs at startup. Only when the DB setting is empty and the file has
+    content, so legacy WORKING.md text becomes durable going forward.
+    An explicit startup write: creating the DB file here is intended
+    (main.py already created it). Best-effort, never raises.
+    """
+    try:
+        saved = store().get_setting(INSTRUCTIONS_SETTING, "")
+        if isinstance(saved, str) and saved.strip():
+            return
+        content = read_context_file(instructions_file_path(), 12000)
+        if content:
+            store().set_setting(INSTRUCTIONS_SETTING, content)
+    except Exception:
+        return
 
 
 def get_mood():
@@ -696,11 +778,12 @@ def vektor_system_prompt():
     # live chat answers that it has no information about its creator.
     code_soul = read_context_file(ROOT / "soul.md")
     memories = []
-    memory_dir = VEKTOR_STATE / "memories"
-    for name in ("USER.md", "MEMORY.md"):
-        content = read_context_file(memory_dir / name, 12000)
-        if content:
-            memories.append(f"## {name}\n{content}")
+    # USER.md only: MEMORY.md is the generated mirror of the DB, and the
+    # DB memories load below under "# Long-term memory" — loading the
+    # mirror too duplicated every memory in the prompt.
+    content = read_context_file(VEKTOR_STATE / "memories" / "USER.md", 12000)
+    if content:
+        memories.append(f"## USER.md\n{content}")
     parts = ["You are Vektor, the VektorCode assistant. Follow the shared Vektor identity and memory below."]
     if code_soul:
         parts.append(f"# VektorCode identity (soul.md)\n{code_soul}")
@@ -1981,18 +2064,24 @@ class Handler(BaseHTTPRequestHandler):
             if not require_auth(self): self.send_json({"ok": False, "error": "Authentication required", "retryable": False}, 401); return
             self.send_json({"ok": True, "memories": store().memory_list()}); return
         if self.path == "/api/memory/file":
-            # The editable MEMORY.md mirror (rebuilt from the DB first, so
-            # it is never stale). Wallace edits it in the UI or on disk.
+            # The editable MEMORY.md mirror, read as-is from disk. A read
+            # never regenerates the file: an edit Wallace made on disk
+            # (not yet imported) must survive a browser refresh. When no
+            # file exists yet, the mirror is rendered from the DB in
+            # memory only — never written.
             if not require_auth(self): self.send_json({"ok": False, "error": "Authentication required", "retryable": False}, 401); return
-            sync_memory_file()
             content = read_context_file(memory_file_path(), 24000)
-            self.send_json({"ok": True, "path": str(memory_file_path()), "content": content, "count": len(store().memory_list() or [])}); return
+            if not content:
+                content = render_memory_file(store().memory_list() or [])
+            self.send_json({"ok": True, "path": str(memory_file_path()), "content": content, "count": len(parse_memory_file(content))}); return
         if self.path == "/api/instructions":
             # WORKING.md (how VektorCode works with Wallace). Unsaved yet:
-            # the starter text is shown, flagged saved=False.
+            # the starter text is shown, flagged saved=False. durable=True
+            # means the text lives in the DB setting and survives a
+            # Render redeploy; the file alone is ephemeral there.
             if not require_auth(self): self.send_json({"ok": False, "error": "Authentication required", "retryable": False}, 401); return
             content = load_instructions()
-            self.send_json({"ok": True, "content": content or DEFAULT_INSTRUCTIONS.strip(), "saved": bool(content)}); return
+            self.send_json({"ok": True, "content": content or DEFAULT_INSTRUCTIONS.strip(), "saved": bool(content), "durable": instructions_are_durable()}); return
         if self.path == "/api/mood":
             self.send_json({"ok": True, "mood": get_mood(), "moods": sorted(MOODS)}); return
         if self.path in ("/", "/index.html") or self.path.startswith("/static/"):
@@ -2129,39 +2218,51 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/memory/file":
             # Write the MEMORY.md mirror from the UI textarea, then import
             # it back into the DB (the file is the editor's intent).
+            # The content is validated before anything is written: a file
+            # with no valid memories is rejected, so an empty textarea
+            # can never wipe the DB through replace semantics.
             if not require_auth(self): self.send_json({"ok":False,"error":"Authentication required"}, 401); return
             content = data.get("content", "")
             if not isinstance(content, str) or len(content) > 24000:
                 self.send_json({"ok":False,"error":"content must be 0-24000 characters"}, 400); return
+            if not parse_memory_file(content):
+                self.send_json({"ok":False,"error":"no memories found in the file — nothing imported"}, 400); return
             try:
                 target = memory_file_path()
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_text(content, encoding="utf-8")
             except OSError as exc:
                 self.send_json({"ok":False,"error":str(exc)}, 500); return
-            imported, skipped = import_memory_file()
+            try:
+                imported, skipped = import_memory_file()
+            except ValueError as exc:
+                self.send_json({"ok":False,"error":str(exc)}, 400); return
             receipt("memory_file_saved", {"imported": imported, "skipped": skipped}, True, True)
             self.send_json({"ok":True, "imported": imported, "skipped": skipped}); return
         if path == "/api/memory/file/import":
             # Reload MEMORY.md from disk (edited on disk, e.g. Termux).
+            # A row that fails validation aborts the whole import; the
+            # DB is left untouched.
             if not require_auth(self): self.send_json({"ok":False,"error":"Authentication required"}, 401); return
-            imported, skipped = import_memory_file()
+            try:
+                imported, skipped = import_memory_file()
+            except ValueError as exc:
+                self.send_json({"ok":False,"error":str(exc)}, 400); return
             receipt("memory_file_imported", {"imported": imported, "skipped": skipped}, True, True)
             self.send_json({"ok":True, "imported": imported, "skipped": skipped}); return
         if path == "/api/instructions":
             # Save WORKING.md (how VektorCode works with Wallace).
+            # Durable first (DB setting), file mirror second.
             if not require_auth(self): self.send_json({"ok":False,"error":"Authentication required"}, 401); return
             content = data.get("content", "")
             if not isinstance(content, str) or not content.strip() or len(content) > 12000:
                 self.send_json({"ok":False,"error":"content must be 1-12000 characters"}, 400); return
             try:
-                target = instructions_file_path()
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_text(content, encoding="utf-8")
+                saved, durable = save_instructions(content)
             except OSError as exc:
                 self.send_json({"ok":False,"error":str(exc)}, 500); return
-            receipt("instructions_saved", {}, True, True)
-            self.send_json({"ok":True}); return
+            receipt("instructions_saved", {"durable": durable}, True, True)
+            self.send_json({"ok":True, "durable": durable}); return
         if path == "/api/mood":
             # Set Wallace's mood (fixed set only; stored in settings).
             if not require_auth(self): self.send_json({"ok":False,"error":"Authentication required"}, 401); return

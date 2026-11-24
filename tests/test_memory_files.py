@@ -343,3 +343,307 @@ def test_restart_survival_all_new_state(mem_env):
     assert "Test first." in prompt
     # The mirror file still exists after the "restart".
     assert app.memory_file_path().is_file()
+
+
+# ---------------------------------------------------------------------------
+# 5. Follow-up 1 (Big Chat CHANGES REQUESTED on PR #17, 2026-11-23)
+# ---------------------------------------------------------------------------
+
+def test_unique_save_is_concurrency_safe(mem_env):
+    """Finding 1: 40 simultaneous same-key saves must create 40 rows."""
+    import threading
+    store = app.store()
+    errors = []
+
+    def save(i):
+        try:
+            store.memory_save_unique("fact", "note", f"value {i}")
+        except Exception as exc:  # noqa: BLE001 - collected, asserted below
+            errors.append(exc)
+
+    threads = [threading.Thread(target=save, args=(i,)) for i in range(40)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errors
+    rows = store.memory_list()
+    assert len(rows) == 40
+    assert len({(r["kind"], r["key"]) for r in rows}) == 40
+    assert {r["value"] for r in rows} == {f"value {i}" for i in range(40)}
+
+
+def test_import_replaces_removed_memories(mem_env):
+    """Finding 2: a memory removed from the file must leave the DB."""
+    store = app.store()
+    for key in ("a", "b", "c"):
+        store.memory_save("fact", key, f"value {key}")
+    app.sync_memory_file()
+    path = app.memory_file_path()
+    path.write_text(
+        "# VektorCode memories\n\n"
+        "## [fact] a\nvalue A2\n\n"
+        "## [fact] c\nvalue c\n\n"
+        "## [fact] d\nvalue d\n", encoding="utf-8")
+    imported, skipped = app.import_memory_file()
+    assert (imported, skipped) == (3, 0)
+    rows = {(r["kind"], r["key"]): r["value"]
+            for r in store.memory_list()}
+    assert rows == {("fact", "a"): "value A2",
+                    ("fact", "c"): "value c",
+                    ("fact", "d"): "value d"}
+    # The mirror regenerates from the DB: B stays gone.
+    assert "## [fact] b" not in path.read_text(encoding="utf-8")
+
+
+def test_import_with_bad_row_aborts_without_touching_db(mem_env):
+    """Finding 2: a bad row aborts the whole import; old data survives."""
+    store = app.store()
+    store.memory_save("fact", "keep", "stays")
+    path = app.memory_file_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("## [fact] keep\nstays\n\n## [bogus] bad\nnope\n",
+                    encoding="utf-8")
+    with pytest.raises(ValueError):
+        app.import_memory_file()
+    assert store.memory_get("fact", "keep")["value"] == "stays"
+    assert len(store.memory_list()) == 1
+
+
+def test_import_empty_file_changes_nothing(mem_env):
+    """Finding 2: an empty file imports nothing and never wipes the DB."""
+    store = app.store()
+    store.memory_save("fact", "keep", "stays")
+    path = app.memory_file_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("", encoding="utf-8")
+    assert app.import_memory_file() == (0, 0)
+    assert len(store.memory_list()) == 1
+
+
+def test_memory_file_endpoint_rejects_content_without_memories(mem_env):
+    """Finding 2: the UI textarea cannot wipe the DB with no memories."""
+    h = make_handler("POST", "/api/memory/file",
+                     {"content": "just some text, no headings\n"})
+    h.do_POST()
+    assert h._status == 400
+    assert not app.memory_file_path().exists()
+    assert len(app.store().memory_list()) == 0
+
+
+def test_prompt_loads_each_memory_once(mem_env):
+    """Finding 3: a DB memory appears exactly once in the prompt."""
+    store = app.store()
+    store.memory_save("fact", "wallace", "created VektorCode")
+    app.sync_memory_file()
+    user_path = app.VEKTOR_STATE / "memories" / "USER.md"
+    user_path.parent.mkdir(parents=True, exist_ok=True)
+    user_path.write_text("Wallace likes short answers.\n", encoding="utf-8")
+    prompt = app.vektor_system_prompt()
+    assert prompt.count("created VektorCode") == 1
+    assert "# Long-term memory" in prompt
+    assert "## MEMORY.md" not in prompt
+    assert "Wallace likes short answers." in prompt  # USER.md still loads
+
+
+def test_instructions_survive_without_the_file(mem_env):
+    """Finding 4: instructions live in the DB setting, not just the file."""
+    h = make_handler("POST", "/api/instructions",
+                     {"content": "# How to work with Wallace\n\n"
+                                "- Always test first.\n"})
+    h.do_POST()
+    assert h._status == 200
+    assert response_json(h)["durable"] is True
+    h = make_handler("GET", "/api/instructions")
+    h.do_GET()
+    body = response_json(h)
+    assert body["saved"] is True and body["durable"] is True
+    # The file is gone (Render redeploy wipes it): instructions survive.
+    app.instructions_file_path().unlink()
+    assert app.load_instructions().strip().endswith("Always test first.")
+    assert app.instructions_are_durable() is True
+    # Restart: fresh store, same DB + state dir.
+    app._STORES.clear()
+    assert "Always test first." in app.load_instructions()
+    assert app.instructions_are_durable() is True
+
+
+def test_instructions_file_fallback_and_migration(mem_env):
+    """Finding 4: legacy file-only instructions load, then migrate to DB."""
+    path = app.instructions_file_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("# How to work with Wallace\n\n- File only.\n",
+                    encoding="utf-8")
+    assert "File only." in app.load_instructions()
+    assert app.instructions_are_durable() is False
+    app.migrate_instructions_to_db()
+    assert app.instructions_are_durable() is True
+    assert "File only." in app.load_instructions()
+
+
+def test_get_memory_file_does_not_overwrite_disk_edits(mem_env):
+    """Finding 5: GET /api/memory/file returns disk content as-is."""
+    store = app.store()
+    store.memory_save("fact", "wallace", "created VektorCode")
+    app.sync_memory_file()
+    path = app.memory_file_path()
+    path.write_text(path.read_text(encoding="utf-8") +
+                    "\n## [lesson] disk\nedited on disk, not yet imported\n",
+                    encoding="utf-8")
+    h = make_handler("GET", "/api/memory/file")
+    h.do_GET()
+    assert h._status == 200
+    body = response_json(h)
+    assert "edited on disk, not yet imported" in body["content"]
+    assert body["count"] == 2
+    # The DB is untouched by the read.
+    assert store.memory_get("lesson", "disk") is None
+    assert len(store.memory_list()) == 1
+
+
+def test_ensure_memory_file_never_overwrites_existing_file(mem_env):
+    """Finding 5 (startup): an existing file is left alone."""
+    path = app.memory_file_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("## [fact] mine\nmy edit\n", encoding="utf-8")
+    app.ensure_memory_file()
+    assert path.read_text(encoding="utf-8") == "## [fact] mine\nmy edit\n"
+    # Missing file: created from the DB.
+    path.unlink()
+    app.store().memory_save("fact", "wallace", "created VektorCode")
+    app.ensure_memory_file()
+    assert "## [fact] wallace" in path.read_text(encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Fake PostgREST: the Supabase legs, with real conflict semantics
+# ---------------------------------------------------------------------------
+
+class FakePostgrest:
+    """In-memory PostgREST stand-in for the Supabase memory table."""
+
+    def __init__(self):
+        self.rows = {}  # (kind, key) -> row dict
+
+    def request(self, method, table, query=None, payload=None, prefer=None,
+                timeout=10):
+        from urllib.parse import unquote
+        assert table == "vektor_memory"
+        query = query or {}
+        if method == "GET":
+            out = [dict(r) for r in self.rows.values()]
+            for name in ("kind", "key"):
+                filt = query.get(name)
+                if filt and filt.startswith("eq."):
+                    want = unquote(filt[3:])
+                    out = [r for r in out if r[name] == want]
+            if query.get("order", "").startswith("updated_at.desc"):
+                out.sort(key=lambda r: r["updated_at"], reverse=True)
+            if "limit" in query:
+                out = out[:int(query["limit"])]
+            return out
+        if method == "POST":
+            if prefer and "ignore-duplicates" in prefer:
+                inserted = []
+                for row in payload:
+                    if (row["kind"], row["key"]) not in self.rows:
+                        self.rows[(row["kind"], row["key"])] = dict(row)
+                        inserted.append(dict(row))
+                return (inserted
+                        if "return=representation" in prefer else None)
+            for row in payload:
+                self.rows[(row["kind"], row["key"])] = dict(row)
+            return None
+        if method == "DELETE":
+            doomed = []
+            for (k, kk) in list(self.rows):
+                ok = True
+                for name, val in (("kind", k), ("key", kk)):
+                    filt = query.get(name)
+                    if filt and filt.startswith("eq."):
+                        if val != unquote(filt[3:]):
+                            ok = False
+                if ok:
+                    doomed.append((k, kk))
+            for key in doomed:
+                del self.rows[key]
+            return None
+        raise AssertionError(f"unexpected method {method}")
+
+
+def _supabase_store(monkeypatch):
+    from vektor_cloud.storage import SupabaseStore
+    fake = FakePostgrest()
+    store = SupabaseStore("https://example.supabase.co", "test-key")
+    monkeypatch.setattr(store, "_request", fake.request)
+    return store, fake
+
+
+def test_supabase_unique_save_suffixes_and_noops(monkeypatch):
+    """Finding 1, Supabase leg: ignore-duplicates insert, same-value noop."""
+    store, fake = _supabase_store(monkeypatch)
+    r1 = store.memory_save_unique("fact", "note", "one")
+    r2 = store.memory_save_unique("fact", "note", "two")
+    assert r1["key"] == "note" and r2["key"] == "note (2)"
+    r3 = store.memory_save_unique("fact", "note", "one")
+    assert r3["key"] == "note"
+    assert len(fake.rows) == 2
+
+
+def test_supabase_unique_save_is_concurrency_safe(monkeypatch):
+    """Finding 1, Supabase leg: racing inserts lose cleanly, retry wins."""
+    import threading
+    import time
+    store, fake = _supabase_store(monkeypatch)
+    # Slow the GETs so every thread observes "absent" before any POST.
+    orig_request = fake.request
+
+    def slow_request(method, table, query=None, payload=None, prefer=None,
+                     timeout=10):
+        if method == "GET":
+            time.sleep(0.01)
+        return orig_request(method, table, query, payload, prefer, timeout)
+
+    monkeypatch.setattr(store, "_request", slow_request)
+    errors = []
+
+    def save(i):
+        try:
+            store.memory_save_unique("fact", "race", f"value {i}")
+        except Exception as exc:  # noqa: BLE001 - collected below
+            errors.append(exc)
+
+    threads = [threading.Thread(target=save, args=(i,)) for i in range(10)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errors
+    assert len(fake.rows) == 10
+    assert len({k for (_, k) in fake.rows}) == 10
+    assert {r["value"] for r in fake.rows.values()} == {
+        f"value {i}" for i in range(10)}
+
+
+def test_supabase_replace_all_deletes_removed_rows(monkeypatch):
+    """Finding 2, Supabase leg: replace deletes rows missing from the set."""
+    store, fake = _supabase_store(monkeypatch)
+    store.memory_save("fact", "a", "1")
+    store.memory_save("fact", "b", "2")
+    store.memory_save("fact", "c", "3")
+    n = store.memory_replace_all([("fact", "a", "1b"), ("fact", "d", "4")])
+    assert n == 2
+    assert {(r["kind"], r["key"]) for r in store.memory_list()} == {
+        ("fact", "a"), ("fact", "d")}
+    assert store.memory_get("fact", "a")["value"] == "1b"
+
+
+def test_supabase_replace_all_validates_first(monkeypatch):
+    """Finding 2, Supabase leg: a bad row aborts before any write."""
+    store, fake = _supabase_store(monkeypatch)
+    store.memory_save("fact", "keep", "stays")
+    with pytest.raises(ValueError):
+        store.memory_replace_all([("fact", "keep", "stays"),
+                                  ("bogus", "bad", "nope")])
+    assert store.memory_get("fact", "keep")["value"] == "stays"
+    assert len(fake.rows) == 1
