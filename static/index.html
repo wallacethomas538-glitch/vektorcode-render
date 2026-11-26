@@ -90,7 +90,7 @@
                     <option value="lesson">lesson</option>
                 </select>
                 <input id="memory-key" type="text" placeholder="Key (leave blank for auto)" maxlength="120" aria-label="Memory key">
-                <input id="memory-value" type="text" placeholder="What should VektorCode remember?" maxlength="12000" aria-label="Memory value">
+                <input id="memory-value" type="text" placeholder="What should VektorCode remember?" maxlength="100000" aria-label="Memory value">
                 <button class="btn-mini" onclick="saveMemory()">Save memory</button>
             </div>
             <p class="panel-note">Memories are stored in the database and read at the start of every chat. Saving with a key that already exists adds a new memory instead of replacing the old one. Only you can add or delete them — the model never writes memory silently.</p>
