@@ -958,3 +958,75 @@ def test_get_instructions_reads_setting_once(mem_env, monkeypatch):
     # Off Render the local SQLite file persists, so it is durable.
     assert body["durable"] is True
     assert calls == ["get_setting"]
+
+
+# ---------------------------------------------------------------------------
+# Memory delete + long-value fixes (2026-11-25, Wallace's report)
+#
+# Wallace: memories "won't disappear" (delete says deleted, row stays) and
+# he "can't save no more" (long pastes refused). Root causes under test:
+#  1. SupabaseStore._request re-encodes pre-quoted filter values
+#     (urlencode without "%" in safe), so keys with spaces/parentheses
+#     ("note (2)") never match a row and DELETE removes nothing while
+#     memory_delete still reports success.
+#  2. validate_memory capped values at 12000 chars, refusing long pastes.
+# ---------------------------------------------------------------------------
+
+from vektor_cloud import storage as _storage
+from vektor_cloud.storage import SupabaseStore, validate_memory
+
+
+class _FakeResp:
+    def __init__(self, body=b""):
+        self._body = body
+
+    def read(self):
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def test_supabase_delete_url_single_encoded(monkeypatch):
+    seen = {}
+
+    def fake_urlopen(req, timeout=None):
+        seen["url"] = req.full_url
+        seen["method"] = req.get_method()
+        return _FakeResp(b"[]")
+
+    monkeypatch.setattr(_storage, "urlopen", fake_urlopen)
+    store = SupabaseStore("https://example.supabase.co", "test-key")
+    store.memory_delete("fact", "note (2)")
+    assert seen["method"] == "DELETE"
+    # The filter value must be encoded exactly once: %20, never %2520.
+    assert "key=eq.note%20%282%29" in seen["url"]
+    assert "%2520" not in seen["url"]
+
+
+def test_supabase_delete_reports_actual_removal(monkeypatch):
+    def fake_urlopen(req, timeout=None):
+        return _FakeResp(b"[]")  # no rows came back: nothing was deleted
+
+    monkeypatch.setattr(_storage, "urlopen", fake_urlopen)
+    store = SupabaseStore("https://example.supabase.co", "test-key")
+    assert store.memory_delete("fact", "missing") is False
+
+
+def test_validate_memory_accepts_long_value():
+    kind, key, value = validate_memory("fact", "big paste", "x" * 50000)
+    assert len(value) == 50000
+
+
+def test_sqlite_delete_suffixed_key(mem_env):
+    store = DashboardStore(mem_env / "m.db")
+    store.memory_save_unique("fact", "note", "first")
+    store.memory_save_unique("fact", "note", "second")
+    keys = sorted(m["key"] for m in store.memory_list())
+    assert keys == ["note", "note (2)"]
+    assert store.memory_delete("fact", "note (2)") is True
+    keys = [m["key"] for m in store.memory_list()]
+    assert keys == ["note"]

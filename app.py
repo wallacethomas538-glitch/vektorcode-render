@@ -2172,7 +2172,7 @@ class Handler(BaseHTTPRequestHandler):
             # file exists yet, the mirror is rendered from the DB in
             # memory only — never written.
             if not require_auth(self): self.send_json({"ok": False, "error": "Authentication required", "retryable": False}, 401); return
-            content = read_context_file(memory_file_path(), 24000)
+            content = read_context_file(memory_file_path(), 500000)
             if not content:
                 content = render_memory_file(store().memory_list() or [])
             # A malformed file still reads as-is (never a 500): the
@@ -2284,8 +2284,8 @@ class Handler(BaseHTTPRequestHandler):
             # -> {kind, key, value}. `kind` defaults to "fact".
             if not require_auth(self): self.send_json({"ok":False,"error":"Authentication required"}, 401); return
             content = data.get("content", "")
-            if not isinstance(content, str) or not content.strip() or len(content) > 12000:
-                self.send_json({"ok":False,"error":"content must be 1-12000 characters"}, 400); return
+            if not isinstance(content, str) or not content.strip() or len(content) > 100000:
+                self.send_json({"ok":False,"error":"content must be 1-100000 characters"}, 400); return
             heading = data.get("title", "Saved note")
             if not isinstance(heading, str) or not heading.strip() or len(heading) > 120:
                 self.send_json({"ok":False,"error":"title is required"}, 400); return
@@ -2337,8 +2337,8 @@ class Handler(BaseHTTPRequestHandler):
             # can never wipe the DB through replace semantics.
             if not require_auth(self): self.send_json({"ok":False,"error":"Authentication required"}, 401); return
             content = data.get("content", "")
-            if not isinstance(content, str) or len(content) > 24000:
-                self.send_json({"ok":False,"error":"content must be 0-24000 characters"}, 400); return
+            if not isinstance(content, str) or len(content) > 500000:
+                self.send_json({"ok":False,"error":"content must be 0-500000 characters"}, 400); return
             # Strict validation before anything is written: a malformed
             # document is rejected, so a bad textarea can never wipe
             # the DB through replace semantics.

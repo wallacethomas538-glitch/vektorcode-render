@@ -101,8 +101,8 @@ def validate_memory(kind, key, value):
             f"kind must be one of {', '.join(MEMORY_KINDS)}")
     if not isinstance(key, str) or not 1 <= len(key.strip()) <= 120:
         raise ValueError("key must be 1-120 characters")
-    if not isinstance(value, str) or not 1 <= len(value) <= 12000:
-        raise ValueError("value must be 1-12000 characters")
+    if not isinstance(value, str) or not 1 <= len(value) <= 100000:
+        raise ValueError("value must be 1-100000 characters")
     return kind, key.strip(), value
 
 
@@ -570,7 +570,7 @@ class SupabaseStore:
                  prefer=None, timeout=10):
         endpoint = f"{self.url}/rest/v1/{table}"
         if query:
-            endpoint += "?" + urlencode(query, safe=".*")
+            endpoint += "?" + urlencode(query, safe=".*%")
         headers = {
             "apikey": self.key,
             "Authorization": "Bearer " + self.key,
@@ -799,14 +799,14 @@ class SupabaseStore:
         return len(validated)
 
     def memory_delete(self, kind, key):
-        # PostgREST DELETE returns no row count here; True means the
-        # request succeeded.
-        self._request(
+        # Ask PostgREST to return the deleted rows so the result is
+        # honest: True only when a row actually went away.
+        rows = self._request(
             "DELETE", MEMORY_TABLE,
             {"kind": "eq." + quote(kind, safe=''),
              "key": "eq." + quote(key, safe='')},
-            None, "return=minimal")
-        return True
+            None, "return=representation")
+        return bool(rows)
 
     # --- MCP registry (universal MCP, 2026-11-07) ---
 
