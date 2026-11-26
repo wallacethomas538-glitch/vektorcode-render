@@ -1030,3 +1030,14 @@ def test_sqlite_delete_suffixed_key(mem_env):
     assert store.memory_delete("fact", "note (2)") is True
     keys = [m["key"] for m in store.memory_list()]
     assert keys == ["note"]
+
+
+def test_memory_value_input_allows_long_paste():
+    # The dashboard input itself capped pastes at 12000 chars (maxlength),
+    # so long memories could never reach the server. It must match the
+    # server-side 100000 cap.
+    html = (Path(app.__file__).parent / "static" / "index.html").read_text(
+        encoding="utf-8")
+    assert 'id="memory-value"' in html
+    assert 'maxlength="12000"' not in html
+    assert 'maxlength="100000"' in html
